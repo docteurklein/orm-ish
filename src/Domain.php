@@ -16,12 +16,12 @@ trait PopEvents
         yield from $this->events;
         $this->events = [];
 
-        foreach (get_object_vars($this) as $prop => $field) {
-            if ($field instanceof HasEvents) {
-                yield from $field->popEvents();
+        foreach (get_object_vars($this) as $prop => $value) {
+            if ($value instanceof HasEvents) {
+                yield from $value->popEvents();
             }
-            if (is_iterable($field)) {
-                foreach ($field as $entry) {
+            if (is_iterable($value)) {
+                foreach ($value as $entry) {
                     if ($entry instanceof HasEvents) {
                         yield from $entry->popEvents();
                     }
@@ -114,7 +114,8 @@ final class Product implements HasEvents
 
     public static function fromResultSet(array $resultSet): self
     {
-        $self = new self($resultSet['attributes']);
+        $self = new self([]);
+        $self->attributes = $resultSet['attributes'];
         $self->id = $resultSet['product_id'];
         $self->events = [];
 
@@ -124,11 +125,16 @@ final class Product implements HasEvents
     public function __construct(iterable $attributes)
     {
         $this->id = uuid_create();
-        $this->attributes = $attributes;
         $this->events[] = new ProductCreated($this->id, $attributes);
         foreach ($attributes as $attribute) {
-            $this->events[] = new AttributeAddedToProduct($this, $attribute);
+            $this->addAttribute($attribute);
         }
+    }
+
+    public function addAttribute(Attribute $attribute): void
+    {
+        $this->attributes[] = $attribute;
+        $this->events[] = new AttributeAddedToProduct($this, $attribute);
     }
 
     public function getId(): string

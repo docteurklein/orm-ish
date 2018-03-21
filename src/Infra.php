@@ -15,8 +15,8 @@ final class Products
 
     public function find($id): Product
     {
-        $resultSet = $this->getLazyResult($id);
-        //$resultSet = $this->getEagerNestedResult($id);
+        //$resultSet = $this->getLazyResult($id);
+        $resultSet = $this->getEagerNestedResult($id);
 
         return Product::fromResultSet($resultSet);
     }
@@ -26,6 +26,7 @@ final class Products
         $result = $this->connection->prepare('fetch_products', <<<SQL
             select product.*
             from product
+limit 1
 SQL
         )->exec([]);
 
@@ -69,7 +70,7 @@ SQL
 
     private function lazyLoadAttributes($productId)
     {
-        return new CachedGenerator((function($productId) {
+        return new MemoizedGenerator((function($productId) {
             $result = $this->connection->prepare('fetch_product_attributes', <<<SQL
                 select attribute.*, row_to_json(f.*) as family
                 from attribute
@@ -97,7 +98,7 @@ SQL
 SQL
         )->exec([$id]);
         $resultSet = $result->fetchRow(\pq\Result::FETCH_ASSOC);
-        $resultSet['attributes'] = new \ArrayObject(array_map([Attribute::class, 'fromResultSet'], $resultSet['attributes']));
+        $resultSet['attributes'] = array_map([Attribute::class, 'fromResultSet'], $resultSet['attributes']);
 
         return $resultSet;
     }
@@ -108,24 +109,7 @@ SQL
     }
 }
 
-final class GeneratorIterator implements \IteratorAggregate
-{
-    private $factory;
-    private $args;
-
-    public function __construct(callable $factory, array $args = [])
-    {
-        $this->factory = $factory;
-        $this->args = $args;
-    }
-
-    public function getIterator()
-    {
-        return call_user_func_array($this->factory, $this->args);
-    }
-}
-
-final class CachedGenerator implements \Iterator, \ArrayAccess
+final class MemoizedGenerator implements \Iterator, \ArrayAccess
 {
     private $generator;
     private $cache = [];
@@ -138,21 +122,29 @@ final class CachedGenerator implements \Iterator, \ArrayAccess
 
     public function offsetGet($offset)
     {
+        $this->cache = iterator_to_array($this->generator);
+        reset($this->cache);
         return $this->cache[$offset];
     }
 
     public function offsetSet($offset, $value)
     {
+        $this->cache = iterator_to_array($this->generator);
+        reset($this->cache);
         return $this->cache[$offset] = $value;
     }
 
     public function offsetExists($offset)
     {
+        $this->cache = iterator_to_array($this->generator);
+        reset($this->cache);
         return isset($this->cache[$offset]);
     }
 
     public function offsetUnset($offset)
     {
+        $this->cache = iterator_to_array($this->generator);
+        reset($this->cache);
         unset($this->cache[$offset]);
     }
 
@@ -205,79 +197,46 @@ final class CachedGenerator implements \Iterator, \ArrayAccess
     }
 }
 
-final class WriteProjection
+final class PQWriteProjection
 {
     private $connection;
+    private $statements;
     private $streams = [];
 
-    public function __construct(\pq\Connection $connection)
+    public function __construct(\pq\Connection $connection, array $statements)
     {
         $this->connection = $connection;
+        $this->statements = $statements;
     }
 
     public function addStream(iterable $events): void
     {
+        if (!$events->valid()) {
+            return;
+        }
         $this->streams[] = $events;
     }
 
     public function commit(): void
     {
+        if (empty($this->streams)) {
+            return;
+        }
+        $transaction = $this->connection->startTransaction();
+        $transaction->connection->exec('SET CONSTRAINTS attribute_family_id_fkey DEFERRED');
+        $transaction->connection->exec('SET CONSTRAINTS product_attribute_attribute_id_fkey DEFERRED');
+        $prepared = [];
         foreach($this->streams as $stream) {
-            if (!$stream->valid()) {
-                continue;
-            }
-            $transaction = $this->connection->startTransaction();
-            $transaction->connection->exec('SET CONSTRAINTS attribute_family_id_fkey DEFERRED');
-            $transaction->connection->exec('SET CONSTRAINTS product_attribute_attribute_id_fkey DEFERRED');
             foreach ($stream as $event) {
-                $eventName = strtolower((new \ReflectionObject($event))->getShortName());
-                switch (true) {
-                    case $event instanceof ProductCreated:
-                        $transaction->connection->prepare($eventName, 'insert into product values($1)')->exec([
-                            $event->id,
-                        ]);
-                        $transaction->connection->notify($eventName, $event->id);
-                        break;
-                    case $event instanceof FamilyCreated:
-                        $transaction->connection->prepare($eventName, 'insert into family values($1, $2)')->exec([
-                            $event->id, $event->name
-                        ]);
-                        $transaction->connection->notify($eventName, $event->id);
-                        break;
-                    case $event instanceof AttributeCreated:
-                        $transaction->connection->prepare($eventName, 'insert into attribute values($1, $2)')->exec([
-                            $event->id, $event->family->getId()
-                        ]);
-                        $transaction->connection->notify($eventName, $event->id);
-                        break;
-                    case $event instanceof AttributeAddedToProduct:
-                        $transaction->connection->prepare($eventName, 'insert into product_attribute values($1, $2)')->exec([
-                            $event->product->getId(), $event->attribute->getId()
-                        ]);
-                        $transaction->connection->notify($eventName, json_encode([
-                            'product_id' => $event->product->getId(),
-                            'attribute_id' => $event->attribute->getId(),
-                        ]));
-                        break;
-                    case $event instanceof FamilyRenamed:
-                        $transaction->connection->prepare($eventName, 'update family set name = $1 where family_id = $2')->exec([
-                            $event->name, $event->id
-                        ]);
-                        $transaction->connection->notify($eventName, json_encode([
-                            'family_id' => $event->id,
-                            'name' => $event->name,
-                        ]));
-                        break;
-                    case $event instanceof EntityChanged:
-                        //$transaction->connection->prepare($eventName, sprintf('upadte %s set %s where id = :id', '', ''))->exec();
-                        break;
-                    default:
-                        $transaction->connection->notify($eventName, null);
-                        break;
+                $eventClass = get_class($event);
+                if (isset($this->statements[$eventClass])) {
+                    [$factory, $exec] = $this->statements[$eventClass];
+                    $prepared[$eventClass] = $prepared[$eventClass] ?? $factory($transaction->connection);
+                    $exec($prepared[$eventClass], $event);
                 }
             }
-            $transaction->commit();
         }
+        $transaction->commit();
         $this->streams = [];
     }
 }
