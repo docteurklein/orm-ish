@@ -1,0 +1,21 @@
+{
+    "name": "docteurklein/orm-ish",
+    "description": "Event based write projections and hydration",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Klein Florian",
+            "email": "florian.klein@free.fr"
+        }
+    ],
+    "require": {},
+    "require-dev": {
+        "phpspec/phpspec": "^4.3"
+    },
+    "autoload": {
+        "psr-4": {
+            "DocteurKlein\\ORMish\\": "src/"
+        }
+    }
+}

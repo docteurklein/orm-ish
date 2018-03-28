@@ -1,7 +1,5 @@
 <?php declare(strict_types=1);
 
-namespace DocteurKlein\ORM;
-
 interface HasEvents
 {
     function popEvents(): iterable;
